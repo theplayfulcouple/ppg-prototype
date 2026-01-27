@@ -92,8 +92,8 @@
   let rafId = null;
 
   // Signal buffers
-  const fsTarget = 30; // target-ish sample rate
-  const bufLen = 10 * fsTarget; // last 10 seconds
+  const fsTarget = 30;           // target-ish sample rate
+  const bufLen = 10 * fsTarget;  // last 10 seconds
   const sig = new Float32Array(bufLen);
   let idx = 0;
 
@@ -102,7 +102,6 @@
   let lastPeakT = 0;
   let lastAbove = false;
 
-  // Simple running stats
   function meanStd(arr) {
     let m = 0;
     for (let i = 0; i < arr.length; i++) m += arr[i];
@@ -128,17 +127,17 @@
     pctx.fillStyle = '#0b1220';
     pctx.fillRect(0, 0, plot.width, plot.height);
 
-    // Grab ordered view of signal
+    // Ordered view of signal
     const ordered = new Float32Array(bufLen);
     for (let i = 0; i < bufLen; i++) {
       ordered[i] = sig[(idx + i) % bufLen];
     }
 
-    // Detrend for display: subtract mean
+    // Detrend for display
     const { mean, std } = meanStd(ordered);
     const scale = std > 1e-6 ? (0.42 * plot.height / std) : 1;
 
-    // Draw center line
+    // Center line
     pctx.strokeStyle = 'rgba(255,255,255,0.12)';
     pctx.beginPath();
     pctx.moveTo(0, plot.height * 0.5);
@@ -159,7 +158,6 @@
   }
 
   function estimateHR() {
-    // Use last 8 seconds of peaks
     const now = performance.now();
     const windowMs = 8000;
     const recent = peakTimes.filter(t => (now - t) <= windowMs);
@@ -171,11 +169,8 @@
       return;
     }
 
-    // Compute IBI median
     const ibis = [];
-    for (let i = 1; i < recent.length; i++) {
-      ibis.push(recent[i] - recent[i - 1]);
-    }
+    for (let i = 1; i < recent.length; i++) ibis.push(recent[i] - recent[i - 1]);
 
     // Reject implausible IBIs (30 to 200 bpm)
     const filtered = ibis.filter(ms => ms >= 300 && ms <= 2000);
@@ -192,9 +187,7 @@
     hrVal.textContent = String(Math.round(bpm));
   }
 
-  function computeFingerPresence(frameData) {
-    // frameData: Uint8ClampedArray RGBA
-    // We use mean brightness and "redness" ratio to guess fingertip cover.
+  function computeFrameAverages(frameData) {
     let r = 0, g = 0, b = 0;
     const n = frameData.length / 4;
     for (let i = 0; i < frameData.length; i += 4) {
@@ -215,44 +208,33 @@
   }
 
   function detectPeaks() {
-    // Use recent portion of ordered signal
     const ordered = new Float32Array(bufLen);
     for (let i = 0; i < bufLen; i++) ordered[i] = sig[(idx + i) % bufLen];
 
-    // Consider last ~3 seconds for thresholding
     const N = Math.min(bufLen, Math.floor(3 * fsTarget));
     const tail = ordered.subarray(bufLen - N);
     const { mean, std } = meanStd(tail);
 
-    // Dynamic threshold
     const thr = mean + 0.6 * std;
-
-    // Evaluate current sample (most recent)
     const cur = ordered[bufLen - 1];
     const now = performance.now();
 
-    // Basic refractory: 300ms
     const refractoryMs = 300;
-
     const above = cur > thr;
 
     if (!lastAbove && above && (now - lastPeakT) > refractoryMs) {
-      // rising edge crossing threshold = peak-ish marker
       peakTimes.push(now);
       lastPeakT = now;
 
-      // Keep peaks in last 20s
       const keepMs = 20000;
       while (peakTimes.length && (now - peakTimes[0]) > keepMs) peakTimes.shift();
     }
-
     lastAbove = above;
   }
 
   async function tryTorch(on) {
     if (!track) return false;
     try {
-      // Not supported on many iPhones. Often works on Android Chrome.
       await track.applyConstraints({ advanced: [{ torch: !!on }] });
       return true;
     } catch (e) {
@@ -297,9 +279,7 @@
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
 
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-    }
+    if (stream) stream.getTracks().forEach(t => t.stop());
     stream = null;
     track = null;
 
@@ -313,30 +293,43 @@
   }
 
   function loop() {
-    // Sample one frame
     const w = frameCanvas.width, h = frameCanvas.height;
 
     frameCtx.drawImage(video, 0, 0, w, h);
     const img = frameCtx.getImageData(0, 0, w, h);
-    const { brightness, redness, g } = computeFingerPresence(img.data);
+    const { brightness, redness, g } = computeFrameAverages(img.data);
 
     // Use mean green as raw PPG sample
     pushSample(g);
 
-    // Finger heuristics
-    // These are intentionally loose.
-    const fingerLikely = (brightness < 160) && (redness > 0.95);
+    // Stricter finger detection to prevent “ghost HR” when finger is off
+    const fingerLikely = (brightness < 140) && (redness > 1.05);
 
-    // Signal quality heuristic: variability in last 3s
+    // Signal variability in last 3s
     const ordered = new Float32Array(bufLen);
     for (let i = 0; i < bufLen; i++) ordered[i] = sig[(idx + i) % bufLen];
     const N = Math.min(bufLen, Math.floor(3 * fsTarget));
     const tail = ordered.subarray(bufLen - N);
     const { std } = meanStd(tail);
 
+    // HARD GATE: no finger = no peaks, no HR
     if (!fingerLikely) {
-      setSignalStatus('warn', 'signal: cover camera with finger');
-    } else if (std < 0.7) {
+      setSignalStatus('warn', 'signal: no finger detected');
+
+      peakTimes.length = 0;
+      lastAbove = false;
+      lastPeakT = 0;
+
+      hrVal.textContent = '--';
+      peakCountEl.textContent = '0';
+
+      drawPlot();
+      rafId = requestAnimationFrame(loop);
+      return;
+    }
+
+    // Quality messages (only when finger is present)
+    if (std < 0.7) {
       setSignalStatus('warn', 'signal: too flat, adjust pressure/light');
     } else if (std > 18) {
       setSignalStatus('warn', 'signal: lots of motion, hold still');
@@ -344,17 +337,13 @@
       setSignalStatus('ok', 'signal: ok');
     }
 
-    // Peak detection and HR update
     detectPeaks();
     estimateHR();
-
-    // Plot
     drawPlot();
 
     rafId = requestAnimationFrame(loop);
   }
 
-  // UI wiring
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
 
@@ -374,4 +363,3 @@
 </script>
 </body>
 </html>
-
