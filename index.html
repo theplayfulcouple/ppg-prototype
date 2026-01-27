@@ -329,7 +329,7 @@
     }
 
     // Quality messages (only when finger is present)
-    if (std < 0.7) {
+    if (std < 0.35) {
       setSignalStatus('warn', 'signal: too flat, adjust pressure/light');
     } else if (std > 18) {
       setSignalStatus('warn', 'signal: lots of motion, hold still');
