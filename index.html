@@ -329,13 +329,8 @@
     }
 
     // Quality messages (only when finger is present)
-    if (std < 0.35) {
-      setSignalStatus('warn', 'signal: too flat, adjust pressure/light');
-    } else if (std > 18) {
-      setSignalStatus('warn', 'signal: lots of motion, hold still');
-    } else {
-      setSignalStatus('ok', 'signal: ok');
-    }
+ setSignalStatus('ok', 'signal: finger detected');
+
 
     detectPeaks();
     estimateHR();
