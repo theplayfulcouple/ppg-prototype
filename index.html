@@ -184,7 +184,18 @@
     const median = filtered.length % 2 ? filtered[mid] : (filtered[mid - 1] + filtered[mid]) / 2;
 
     const bpm = 60000 / median;
-    hrVal.textContent = String(Math.round(bpm));
+const bpmRounded = Math.round(bpm);
+
+hrVal.textContent = String(bpmRounded);
+
+// --- SEND bpm to parent (breath page) ---
+try{
+  window.parent.postMessage(
+    { type: "PPG_HR", bpm: bpmRounded },
+    "*"
+  );
+}catch(e){}
+
   }
 
   function computeFrameAverages(frameData) {
@@ -288,6 +299,11 @@
     torchBtn.disabled = true;
 
     hrVal.textContent = '--';
+
+    try{
+  window.parent.postMessage({ type: "PPG_HR", bpm: null }, "*");
+}catch(e){}
+
     peakCountEl.textContent = '0';
     setSignalStatus('', 'signal: stopped');
   }
