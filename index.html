@@ -71,6 +71,103 @@
 
 <script>
 (() => {
+  // =========================================================
+  // CROSS-PAGE COMMS (PPG page <-> Breath page)
+  //
+  // Matches the Breath page comms layer:
+  // - BroadcastChannel (best, same-origin)
+  // - postMessage (works across iframes/windows)
+  // - localStorage event (fallback)
+  //
+  // IMPORTANT:
+  // - envelope includes {channel:"TPC_HRV_PROTO_V1", type:"..."}
+  // - do not rely on origin rules during prototype (Wix can vary)
+  // =========================================================
+  const TPC_CHANNEL = "TPC_HRV_PROTO_V1";
+  const STORAGE_KEY = `${TPC_CHANNEL}:last`;
+
+  const canBroadcast = typeof BroadcastChannel !== "undefined";
+  const bc = canBroadcast ? new BroadcastChannel(TPC_CHANNEL) : null;
+
+  function safeJsonParse(str){
+    try { return JSON.parse(str); } catch { return null; }
+  }
+
+  function isValidEnvelope(data){
+    return data && typeof data === "object" && data.channel === TPC_CHANNEL && typeof data.type === "string";
+  }
+
+  function publish(payload){
+    const envelope = {
+      channel: TPC_CHANNEL,
+      ...payload,
+      ts: Date.now(),
+    };
+
+    // 1) BroadcastChannel
+    if (bc) {
+      try { bc.postMessage(envelope); } catch {}
+    }
+
+    // 2) postMessage to parent/opener
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage(envelope, "*");
+      }
+    } catch {}
+
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(envelope, "*");
+      }
+    } catch {}
+
+    // 3) localStorage fallback
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
+    } catch {}
+  }
+
+  function subscribe(handler){
+    if (bc) {
+      bc.onmessage = (e) => {
+        const data = e.data;
+        if (!isValidEnvelope(data)) return;
+        handler(data);
+      };
+    }
+
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!isValidEnvelope(data)) return;
+      handler(data);
+    });
+
+    window.addEventListener("storage", (e) => {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      const data = safeJsonParse(e.newValue);
+      if (!isValidEnvelope(data)) return;
+      handler(data);
+    });
+  }
+
+  // OPTIONAL: receive breath phase (kept lightweight, does not change PPG logic)
+  // You can later use this to tag peaks as "inhale vs exhale" etc.
+  let lastBreathPhase = null;
+  subscribe((msg) => {
+    if (msg.type === "BREATH_READY") {
+      // Breath page says it is alive
+      return;
+    }
+    if (msg.type === "BREATH_PHASE") {
+      lastBreathPhase = msg.phase || null;
+      return;
+    }
+  });
+
+  // =========================================================
+  // UI elements
+  // =========================================================
   const startBtn = document.getElementById('startBtn');
   const stopBtn  = document.getElementById('stopBtn');
   const torchBtn = document.getElementById('torchBtn');
@@ -157,6 +254,34 @@
     pctx.stroke();
   }
 
+  // =========================================================
+  // SEND: bpm to Breath page (throttled)
+  // =========================================================
+  let lastSentBpm = null;
+  let lastSentAt = 0;
+  const SEND_MIN_INTERVAL_MS = 900; // keep comms light
+
+  function sendBpm(bpmRounded){
+    const now = performance.now();
+    if (bpmRounded === lastSentBpm && (now - lastSentAt) < SEND_MIN_INTERVAL_MS) return;
+
+    lastSentBpm = bpmRounded;
+    lastSentAt = now;
+
+    publish({
+      type: "PPG_HR",
+      bpm: bpmRounded,
+      // optional context for later use
+      breathPhase: lastBreathPhase || undefined
+    });
+  }
+
+  function sendBpmNull(){
+    lastSentBpm = null;
+    lastSentAt = performance.now();
+    publish({ type: "PPG_HR", bpm: null });
+  }
+
   function estimateHR() {
     const now = performance.now();
     const windowMs = 8000;
@@ -184,18 +309,12 @@
     const median = filtered.length % 2 ? filtered[mid] : (filtered[mid - 1] + filtered[mid]) / 2;
 
     const bpm = 60000 / median;
-const bpmRounded = Math.round(bpm);
+    const bpmRounded = Math.round(bpm);
 
-hrVal.textContent = String(bpmRounded);
+    hrVal.textContent = String(bpmRounded);
 
-// --- SEND bpm to parent (breath page) ---
-try{
-  window.parent.postMessage(
-    { type: "PPG_HR", bpm: bpmRounded },
-    "*"
-  );
-}catch(e){}
-
+    // --- SEND bpm to breath page ---
+    sendBpm(bpmRounded);
   }
 
   function computeFrameAverages(frameData) {
@@ -277,6 +396,9 @@ try{
 
       setSignalStatus('warn', 'signal: place finger on camera');
 
+      // tell breath page we are alive
+      publish({ type: "PPG_READY" });
+
       loop();
     } catch (err) {
       console.error(err);
@@ -299,10 +421,11 @@ try{
     torchBtn.disabled = true;
 
     hrVal.textContent = '--';
+    peakTimes.length = 0;
+    lastAbove = false;
+    lastPeakT = 0;
 
-    try{
-  window.parent.postMessage({ type: "PPG_HR", bpm: null }, "*");
-}catch(e){}
+    sendBpmNull();
 
     peakCountEl.textContent = '0';
     setSignalStatus('', 'signal: stopped');
@@ -339,14 +462,20 @@ try{
       hrVal.textContent = '--';
       peakCountEl.textContent = '0';
 
+      // also tell breath page "no bpm"
+      sendBpmNull();
+
       drawPlot();
       rafId = requestAnimationFrame(loop);
       return;
     }
 
     // Quality messages (only when finger is present)
- setSignalStatus('ok', 'signal: finger detected');
+    setSignalStatus('ok', 'signal: finger detected');
 
+    // OPTIONAL: publish a simple quality number (0..1) later if you want.
+    // Keeping stable for now, but we can expose this with one line:
+    // publish({ type:"PPG_QUALITY", q: Math.max(0, Math.min(1, std / 25)) });
 
     detectPeaks();
     estimateHR();
